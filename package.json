@@ -1,0 +1,33 @@
+{
+  "name": "supabase-material-updater",
+  "version": "1.0.0",
+  "description": "A tool to update material prices from vendor websites",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "update-hcp": "node housecall-pro-updater.js",
+    "api": "node api-server.js",
+    "scrape": "node price-scraper.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "supabase",
+    "puppeteer",
+    "scraper"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.2.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.8.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.21.2",
+    "puppeteer": "^21.5.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "winston": "^3.11.0"
+  }
+}
