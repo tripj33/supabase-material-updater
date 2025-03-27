@@ -497,6 +497,10 @@ app.post('/api/scraper/material/:materialId', async (req, res) => {
     // Include outdated URLs in the response
     result.outdatedUrls = outdatedUrls;
     
+    // Close the browser
+    await scraperService.close();
+    logger.info('Browser closed after processing material item');
+    
     res.status(result.success ? 200 : 400).json(result);
   } catch (error) {
     logger.error(`Error processing material item: ${error.message}`);
@@ -573,6 +577,10 @@ app.post('/api/scraper/materials', async (req, res) => {
     
     // Clean up
     await scraperService.cleanupScreenshots();
+    
+    // Close the browser
+    await scraperService.close();
+    logger.info('Browser closed after processing all material items');
     
     res.status(200).json({
       success: true,
