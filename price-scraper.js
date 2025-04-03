@@ -128,6 +128,91 @@ function groupItemSourcesByDomain(itemSources) {
 }
 
 /**
+ * Test database connection
+ * @returns {Promise<boolean>} Connection success status
+ */
+async function testDatabaseConnection() {
+  try {
+    logger.info('Testing database connection...');
+    
+    // Query a simple table
+    const result = await databaseService.query('SELECT COUNT(*) FROM item_sources');
+    
+    logger.info(`Database connection test successful. Found ${result.rows[0].count} item sources.`);
+    return true;
+  } catch (error) {
+    logger.error(`Database connection test failed: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    return false;
+  }
+}
+
+/**
+ * Verify a UUID exists directly in the database
+ * @param {string} uuid - The UUID to check
+ * @returns {Promise<boolean>} Whether the UUID exists
+ */
+async function verifyUuidExists(uuid) {
+  try {
+    logger.info(`Directly verifying UUID ${uuid} exists in database...`);
+    const result = await databaseService.query('SELECT EXISTS(SELECT 1 FROM item_sources WHERE id = $1)', [uuid]);
+    const exists = result.rows[0].exists;
+    logger.info(`Direct verification: UUID ${uuid} exists in database: ${exists}`);
+    return exists;
+  } catch (error) {
+    logger.error(`Error during direct UUID verification: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    return false;
+  }
+}
+
+/**
+ * Check if an item source ID exists in the item_sources table
+ * @param {string} itemSourceId - The item source ID to check
+ * @returns {Promise<boolean>} Whether the item source exists
+ */
+async function checkItemSourceExists(itemSourceId) {
+  try {
+    logger.info(`Checking if item source ${itemSourceId} exists in database...`);
+    
+    // Log the exact query
+    const queryText = 'SELECT id FROM item_sources WHERE id = $1';
+    logger.info(`Executing query: "${queryText}" with params: [${itemSourceId}]`);
+    
+    const result = await databaseService.query(queryText, [itemSourceId]);
+    
+    // Log the raw result
+    logger.info(`Query result: ${JSON.stringify(result)}`);
+    
+    const exists = result && result.rows && result.rows.length > 0;
+    
+    logger.info(`Item source ${itemSourceId} exists: ${exists}`);
+    
+    // If it doesn't exist, double-check with a direct verification
+    if (!exists) {
+      logger.info(`Item source not found. Performing direct verification for ${itemSourceId}...`);
+      const directCheck = await verifyUuidExists(itemSourceId);
+      logger.info(`Direct verification result for ${itemSourceId}: ${directCheck}`);
+      
+      // Also log all item sources for debugging
+      const allSources = await databaseService.query('SELECT id FROM item_sources LIMIT 10');
+      logger.info(`Sample of item sources in database:`);
+      for (const row of allSources.rows) {
+        logger.info(`  - ${row.id}`);
+      }
+      
+      return directCheck;
+    }
+    
+    return exists;
+  } catch (error) {
+    logger.error(`Error checking if item source exists: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
+    return false;
+  }
+}
+
+/**
  * Process all item sources for a material item
  * @param {Object} materialItem - The material item to process
  * @returns {Promise<Object>} Result of processing
@@ -135,6 +220,9 @@ function groupItemSourcesByDomain(itemSources) {
 async function processMaterialItem(materialItem) {
   try {
     logger.info(`Processing material item ${materialItem.id}: ${materialItem.name}`);
+    
+    // Test database connection first
+    await testDatabaseConnection();
     
     // Fetch item sources for this material item
     const itemSources = await databaseService.fetchItemSources(materialItem.id);
@@ -184,123 +272,131 @@ async function processMaterialItem(materialItem) {
     // Update material item if we have pricing information
     if (lowestPriceSource && highestPriceSource) {
       try {
-        // Get all sources for debugging
+        // Log all available item sources for debugging
+        logger.info(`Available item sources in database:`);
+        updatedItemSources.forEach(source => {
+          logger.info(`Item Source ID: ${source.id}, Source ID: ${source.source_id}, Price: ${source.price_with_tax}`);
+        });
+        
+        // Log details about the chosen item sources
+        logger.info(`Lowest price item source details: ID=${lowestPriceSource.id}, Price=${lowestPriceSource.price_with_tax}`);
+        logger.info(`Highest price item source details: ID=${highestPriceSource.id}, Price=${highestPriceSource.price_with_tax}`);
+        
+        // Get source information for generating notes
         const allSources = await databaseService.getAllSources();
         
-        // Check if these IDs exist in the sources table
-        const lowestPriceSourceExists = allSources.some(source => source.id.startsWith(lowestPriceSource.source_id));
-        const highestPriceSourceExists = allSources.some(source => source.id.startsWith(highestPriceSource.source_id));
+        // Find the actual source names based on source_id from the item_sources
+        const lowestPriceSourceInfo = allSources.find(source => source.id.startsWith(lowestPriceSource.source_id));
+        const highestPriceSourceInfo = allSources.find(source => source.id.startsWith(highestPriceSource.source_id));
         
-        // Find the actual source IDs from the database
-        const actualLowestSourceId = lowestPriceSourceExists 
-          ? allSources.find(source => source.id.startsWith(lowestPriceSource.source_id))?.id
-          : null;
+        const lowestPriceVendorName = lowestPriceSourceInfo ? lowestPriceSourceInfo.name : 'Unknown Vendor';
+        const highestPriceVendorName = highestPriceSourceInfo ? highestPriceSourceInfo.name : 'Unknown Vendor';
         
-        const actualHighestSourceId = highestPriceSourceExists
-          ? allSources.find(source => source.id.startsWith(highestPriceSource.source_id))?.id
-          : null;
+        // Generate notes text
+        const notes = generateNotesText(lowestPriceVendorName, highestPriceVendorName);
         
-        if (!lowestPriceSourceExists || !highestPriceSourceExists) {
-          logger.error(`Source IDs do not exist in sources table`);
-          
-          // Find the first valid source ID to use as a fallback
-          if (allSources.length > 0) {
-            const fallbackSourceId = allSources[0].id;
-            const fallbackSourceName = allSources[0].name;
-            
-            // Generate notes text
-            const notes = generateNotesText(fallbackSourceName, fallbackSourceName);
-            
-            // Update material item with fallback source ID
-            await databaseService.updateMaterialItem(
-              materialItem.id,
-              lowestPriceSource.price_with_tax,
-              fallbackSourceId,
-              highestPriceSource.price_with_tax,
-              notes
-            );
-            
-            logger.info(`Updated material item ${materialItem.id} with new pricing information (using fallback vendor ID)`);
-            
-            return {
-              success: true,
-              message: `Updated material item ${materialItem.id} with new pricing information (using fallback vendor ID)`,
-              materialItem,
-              updatedItemSources,
-              lowestPriceSource,
-              highestPriceSource,
-              usedFallback: true
-            };
-          }
-          
-          logger.warn(`Skipping update for material item ${materialItem.id} due to missing source information`);
-          
+        // Verify the item source ID exists in the item_sources table before updating
+        // Directly check for the item source ID
+        logger.info(`Performing direct check for item source ID: ${lowestPriceSource.id}`);
+        const directCheckResult = await verifyUuidExists(lowestPriceSource.id);
+        
+        if (!directCheckResult) {
+          logger.error(`Cannot update cheapest_vendor_id: Item source ID ${lowestPriceSource.id} does not exist in item_sources table according to direct check!`);
           return {
             success: false,
-            message: `Skipping update for material item ${materialItem.id} due to missing source information`,
+            message: `Cannot update with item source - ID does not exist in item_sources table`,
             materialItem,
             updatedItemSources
           };
         }
         
-        try {
-          // Get vendor names using the actual source IDs from the database
-          const lowestPriceVendor = await databaseService.getSourceById(actualLowestSourceId);
-          const highestPriceVendor = await databaseService.getSourceById(actualHighestSourceId);
+        // Now check through the function
+        const itemSourceExists = await checkItemSourceExists(lowestPriceSource.id);
+        if (!itemSourceExists) {
+          logger.error(`Cannot update cheapest_vendor_id: Item source ID ${lowestPriceSource.id} does not exist in item_sources table!`);
           
-          if (!lowestPriceVendor || !highestPriceVendor) {
-            logger.error(`Could not get vendor information for source IDs: ${actualLowestSourceId}, ${actualHighestSourceId}`);
+          // Try to query all item sources and log them
+          try {
+            const allItemSources = await databaseService.query('SELECT id FROM item_sources');
+            logger.info(`All item source IDs in database (${allItemSources.rows.length} total):`);
+            for (let i = 0; i < Math.min(20, allItemSources.rows.length); i++) {
+              logger.info(`  ${i+1}. ${allItemSources.rows[i].id}`);
+            }
             
-            return {
-              success: false,
-              message: `Could not get vendor information for source IDs: ${actualLowestSourceId}, ${actualHighestSourceId}`,
-              materialItem,
-              updatedItemSources
-            };
+            // Check if the ID is in this list (case sensitive exact match)
+            const matchingRow = allItemSources.rows.find(row => row.id === lowestPriceSource.id);
+            logger.info(`Direct case-sensitive match found in all item sources: ${!!matchingRow}`);
+            
+            // Try a case-insensitive match
+            const caseInsensitiveMatch = allItemSources.rows.find(row => 
+              row.id.toLowerCase() === lowestPriceSource.id.toLowerCase()
+            );
+            logger.info(`Case-insensitive match found in all item sources: ${!!caseInsensitiveMatch}`);
+          } catch (error) {
+            logger.error(`Error querying all item sources: ${error.message}`);
           }
-          
-          // Generate notes text
-          const notes = generateNotesText(lowestPriceVendor.name, highestPriceVendor.name);
-          
-          // Update material item
-          await databaseService.updateMaterialItem(
-            materialItem.id,
-            lowestPriceSource.price_with_tax,
-            actualLowestSourceId,
-            highestPriceSource.price_with_tax,
-            notes
-          );
-          
-          logger.info(`Updated material item ${materialItem.id} with new pricing information`);
-          
-          return {
-            success: true,
-            message: `Updated material item ${materialItem.id} with new pricing information`,
-            materialItem,
-            updatedItemSources,
-            lowestPriceSource,
-            highestPriceSource,
-            lowestPriceVendor,
-            highestPriceVendor
-          };
-        } catch (error) {
-          logger.error(`Error updating material item: ${error.message}`);
           
           return {
             success: false,
-            message: `Error updating material item: ${error.message}`,
+            message: `Cannot update with item source - ID does not exist in item_sources table`,
             materialItem,
-            updatedItemSources,
-            error: error.message
+            updatedItemSources
           };
         }
+        
+        // Log the exact data being sent to update
+        logger.info(`Updating material item with the following data:`);
+        logger.info(`- Material ID: ${materialItem.id}`);
+        logger.info(`- Lowest Price: ${lowestPriceSource.price_with_tax}`);
+        logger.info(`- Cheapest Item Source ID: ${lowestPriceSource.id}`); // Using item_source.id instead of source.id
+        logger.info(`- Highest Price: ${highestPriceSource.price_with_tax}`);
+        logger.info(`- Notes: ${notes}`);
+        
+        // Update material item with the item_source.id (not the source.id)
+        await databaseService.updateMaterialItem(
+          materialItem.id,
+          lowestPriceSource.price_with_tax,
+          lowestPriceSource.id, // Use the item_source.id (not source.id)
+          highestPriceSource.price_with_tax,
+          notes
+        );
+        
+        logger.info(`Updated material item ${materialItem.id} with new pricing information`);
+        
+        return {
+          success: true,
+          message: `Updated material item ${materialItem.id} with new pricing information`,
+          materialItem,
+          updatedItemSources,
+          lowestPriceSource,
+          highestPriceSource
+        };
       } catch (error) {
-        logger.error(`Error updating material item ${materialItem.id}: ${error.message}`);
+        logger.error(`Error updating material item: ${error.message}`);
+        logger.error(`Stack trace: ${error.stack}`);
+        
+        // Add additional error details for debugging
+        if (error.constraint === 'fk_cheapest_vendor') {
+          logger.error(`Foreign key constraint violation: The attempted cheapest_vendor_id doesn't exist in item_sources table`);
+          
+          if (lowestPriceSource) {
+            logger.error(`Attempted to set item source ID ${lowestPriceSource.id} as cheapest vendor`);
+            
+            // Try to query the database directly to see if this ID exists
+            try {
+              const exists = await verifyUuidExists(lowestPriceSource.id);
+              logger.error(`Direct database check for ${lowestPriceSource.id}: exists=${exists}`);
+            } catch (checkError) {
+              logger.error(`Error during direct check: ${checkError.message}`);
+            }
+          }
+        }
         
         return {
           success: false,
-          message: `Error updating material item ${materialItem.id}: ${error.message}`,
+          message: `Error updating material item: ${error.message}`,
           materialItem,
+          updatedItemSources,
           error: error.message
         };
       }
@@ -316,6 +412,7 @@ async function processMaterialItem(materialItem) {
     }
   } catch (error) {
     logger.error(`Error processing material item ${materialItem.id}: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
     
     return {
       success: false,
@@ -391,6 +488,7 @@ async function main(options = {}) {
         }
       } catch (error) {
         logger.error(`Failed to process material item ${item.id}: ${error.message}`);
+        logger.error(`Stack trace: ${error.stack}`);
         results.failed++;
         results.details.push({
           success: false,
@@ -421,6 +519,7 @@ async function main(options = {}) {
     logger.info('Price scraper completed');
   } catch (error) {
     logger.error(`Error running price scraper: ${error.message}`);
+    logger.error(`Stack trace: ${error.stack}`);
     
     // Ensure browser is closed even if there's an error
     try {

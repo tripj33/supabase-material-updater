@@ -72,9 +72,33 @@ class ScraperService {
     try {
       logger.info('Initializing Puppeteer browser');
       this.browser = await puppeteer.launch({
-        headless: false, // Set to false to make the browser visible
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        // headless: false, // Set to false to make the browser visible
+        args: [
+          '--no-sandbox', 
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--disable-gpu',
+          '--window-size=1280,800'
+        ],
+        protocolTimeout: 60000, // Set protocol timeout to 60 seconds
+        defaultViewport: { width: 1280, height: 800 }
       });
+      
+      // Add error handler for browser disconnection
+      this.browser.on('disconnected', async () => {
+        logger.error('Browser disconnected unexpectedly');
+        this.browser = null;
+        this.pages = {};
+        this.loggedInDomains = new Set();
+        
+        // Wait a bit before attempting to reinitialize
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Don't auto-reinitialize, let the next operation handle it
+        logger.info('Browser disconnected - will reinitialize on next operation');
+      });
+      
       logger.info('Puppeteer browser initialized');
     } catch (error) {
       logger.error(`Error initializing browser: ${error.message}`);
@@ -102,48 +126,123 @@ class ScraperService {
    * @returns {Promise<Page>} Puppeteer page object
    */
   async getPage(domain) {
+    // Make sure we have a browser instance
     if (!this.browser) {
       await this.initialize();
     }
 
-    // If we already have a page for this domain, return it
-    if (this.pages[domain]) {
-      return this.pages[domain];
-    }
-    
-    // Check how many pages are currently open
-    const openDomains = Object.keys(this.pages);
-    
-    // If we have 2 or more pages open, close the oldest one that's not the current domain
-    if (openDomains.length >= 2) {
-      logger.info(`Limiting to 2 open tabs. Closing oldest tab for resource efficiency.`);
-      const oldestDomain = openDomains[0]; // First domain is the oldest
-      
-      // Close the page
-      try {
-        await this.pages[oldestDomain].close();
-        logger.info(`Closed page for domain: ${oldestDomain}`);
-      } catch (error) {
-        logger.warn(`Error closing page for domain ${oldestDomain}: ${error.message}`);
+    try {
+      // If we already have a page for this domain and it's not closed, return it
+      if (this.pages[domain]) {
+        // Check if the page is still valid
+        try {
+          // Simple test to see if page is still responsive
+          await this.pages[domain].evaluate(() => true);
+          return this.pages[domain];
+        } catch (error) {
+          logger.warn(`Page for ${domain} is no longer responsive: ${error.message}`);
+          delete this.pages[domain];
+          // Continue with getting a new page
+        }
       }
       
-      // Remove from pages object
-      delete this.pages[oldestDomain];
+      // Close ALL open pages before creating a new one
+      const openDomains = Object.keys(this.pages);
+      
+      // Close all existing pages
+      if (openDomains.length > 0) {
+        logger.info(`Ensuring only one tab is open. Closing all existing tabs.`);
+        
+        for (const oldDomain of openDomains) {
+          // Close the page
+          try {
+            await this.pages[oldDomain].close();
+            logger.info(`Closed page for domain: ${oldDomain}`);
+          } catch (error) {
+            logger.warn(`Error closing page for domain ${oldDomain}: ${error.message}`);
+          }
+          
+          // Remove from pages object
+          delete this.pages[oldDomain];
+        }
+      }
+      
+      // If browser has crashed or disconnected, reinitialize
+      if (!this.browser) {
+        logger.info('Browser appears to be disconnected, reinitializing...');
+        await this.initialize();
+      }
+      
+      // Create a new page for this domain with retry
+      let retries = 0;
+      const maxRetries = 3;
+      let lastError = null;
+      
+      while (retries < maxRetries) {
+        try {
+          logger.info(`Creating new page for domain: ${domain} (attempt ${retries + 1}/${maxRetries})`);
+          this.pages[domain] = await this.browser.newPage();
+          
+          // Set user agent
+          await this.pages[domain].setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          );
+          
+          // Add error handler for page crash
+          this.pages[domain].on('error', (err) => {
+            logger.error(`Page for ${domain} crashed: ${err.message}`);
+            delete this.pages[domain];
+          });
+          
+          // Add additional page settings to improve stability
+          await this.pages[domain].setCacheEnabled(true);
+          await this.pages[domain].setDefaultNavigationTimeout(90000); // 90 seconds
+          await this.pages[domain].setDefaultTimeout(30000); // 30 seconds for other operations
+          
+          // Set request interception to block unwanted resources
+          await this.pages[domain].setRequestInterception(true);
+          this.pages[domain].on('request', (request) => {
+            const resourceType = request.resourceType();
+            // Block unnecessary resource types to reduce browser load
+            if (['image', 'media', 'font', 'stylesheet'].includes(resourceType)) {
+              request.abort();
+            } else {
+              request.continue();
+            }
+          });
+          
+          return this.pages[domain];
+        } catch (error) {
+          lastError = error;
+          logger.warn(`Failed to create page for ${domain}: ${error.message}. Retrying (${retries + 1}/${maxRetries})`);
+          retries++;
+          
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // If browser has crashed, reinitialize
+          if (!this.browser) {
+            logger.info('Browser crashed during page creation, reinitializing...');
+            await this.initialize();
+          }
+        }
+      }
+      
+      // If we reached here, all retries failed
+      throw lastError || new Error(`Failed to create page for ${domain} after ${maxRetries} attempts`);
+    } catch (error) {
+      logger.error(`Fatal error getting page for ${domain}: ${error.message}`);
+      
+      // Attempt recovery by closing and reinitializing the browser
+      try {
+        await this.close();
+        logger.info('Closed browser after fatal error. Will reinitialize on next operation.');
+      } catch (closeError) {
+        logger.error(`Error closing browser: ${closeError.message}`);
+      }
+      
+      throw error;
     }
-    
-    // Create a new page for this domain
-    logger.info(`Creating new page for domain: ${domain}`);
-    this.pages[domain] = await this.browser.newPage();
-    
-    // Set viewport size
-    await this.pages[domain].setViewport({ width: 1280, height: 800 });
-    
-    // Set user agent
-    await this.pages[domain].setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    );
-    
-    return this.pages[domain];
   }
 
   /**
@@ -596,65 +695,121 @@ class ScraperService {
    * @returns {Promise<string|null>} Path to the screenshot or null if failed
    */
   async takeScreenshot(url, itemId) {
-    try {
-      const domain = this.extractDomain(url);
-      logger.info(`Taking screenshot of ${url}`);
-      
-      // Check if we need to skip URLs for domains we're not logged into
-      // Note: HD Supply (ebarnett.com) doesn't require login to view product pages
-      const domainChecks = [
-        { domain: 'winsupplyinc.com', loginDomain: 'winsupplyinc.com', name: 'WinSupply', requiresLogin: true },
-        { domain: 'homedepot.com', loginDomain: 'homedepot.com', name: 'Home Depot', requiresLogin: false },
-        { domain: 'ebarnett.com', loginDomain: 'ebarnett.com', name: 'HD Supply', requiresLogin: false },
-        { domain: 'supplyhouse.com', loginDomain: 'supplyhouse.com', name: 'SupplyHouse.com', requiresLogin: false }
-      ];
-      
-      // Find the matching domain check
-      const domainCheck = domainChecks.find(check => domain.includes(check.domain));
-      
-      // If this is a domain that requires login and we're not logged in, skip it
-      if (domainCheck && domainCheck.requiresLogin && !this.loggedInDomains.has(domainCheck.loginDomain)) {
-        logger.error(`Cannot process ${domainCheck.name} URL: ${url} - not logged in`);
-        return null;
-      }
-      
-      // Get page for this domain
-      const page = await this.getPage(domain);
-      
-      // Navigate to URL with extended timeout
+    let retries = 0;
+    const maxRetries = 2;
+    
+    while (retries <= maxRetries) {
       try {
-        await page.goto(url, {
-          waitUntil: 'networkidle2',
-          timeout: 90000 // Increased to 90 seconds
+        const domain = this.extractDomain(url);
+        logger.info(`Taking screenshot of ${url} (attempt ${retries + 1}/${maxRetries + 1})`);
+        
+        // Check if we need to skip URLs for domains we're not logged into
+        // Note: HD Supply (ebarnett.com) doesn't require login to view product pages
+        const domainChecks = [
+          { domain: 'winsupplyinc.com', loginDomain: 'winsupplyinc.com', name: 'WinSupply', requiresLogin: true },
+          { domain: 'homedepot.com', loginDomain: 'homedepot.com', name: 'Home Depot', requiresLogin: false },
+          { domain: 'ebarnett.com', loginDomain: 'ebarnett.com', name: 'HD Supply', requiresLogin: false },
+          { domain: 'supplyhouse.com', loginDomain: 'supplyhouse.com', name: 'SupplyHouse.com', requiresLogin: false }
+        ];
+        
+        // Find the matching domain check
+        const domainCheck = domainChecks.find(check => domain.includes(check.domain));
+        
+        // If this is a domain that requires login and we're not logged in, skip it
+        if (domainCheck && domainCheck.requiresLogin && !this.loggedInDomains.has(domainCheck.loginDomain)) {
+          logger.error(`Cannot process ${domainCheck.name} URL: ${url} - not logged in`);
+          return null;
+        }
+        
+        // Get page for this domain
+        const page = await this.getPage(domain);
+        
+        // Navigate to URL with progressively shortened timeouts on retries
+        try {
+          // Decrease the timeout on each retry to prevent long waits for problematic pages
+          const timeout = Math.max(30000, 90000 - (retries * 30000));
+          
+          await page.goto(url, {
+            waitUntil: 'domcontentloaded', // Less strict than networkidle2 to avoid timeouts
+            timeout: timeout
+          });
+          
+          // After basic content is loaded, wait a short time for additional resources
+          await page.waitForTimeout(2000);
+          
+          // Now check if we have a more complete page load
+          try {
+            await page.waitForFunction(
+              () => document.readyState === 'complete',
+              { timeout: 5000 }
+            );
+          } catch (readyStateError) {
+            logger.warn(`Page didn't reach 'complete' state for ${url}, continuing anyway`);
+          }
+          
+        } catch (timeoutError) {
+          // If we're close to timeout, take a screenshot anyway and continue
+          if (timeoutError.message.includes('timeout')) {
+            logger.warn(`Page load timeout for ${url}, taking screenshot anyway`);
+          } else {
+            throw timeoutError;
+          }
+        }
+        
+        // Handle common popups and overlays
+        await this.handleCommonPopups(page, domain);
+        
+        // Wait a bit more after handling popups
+        await page.waitForTimeout(1000);
+        
+        // Take screenshot
+        const screenshotPath = path.join(screenshotsDir, `${itemId}_${Date.now()}.jpg`);
+        await page.screenshot({ 
+          path: screenshotPath, 
+          type: 'jpeg', 
+          quality: 80,
+          fullPage: false,
+          clip: {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800
+          }
         });
-      } catch (timeoutError) {
-        // If we're close to timeout, take a screenshot anyway and continue
-        if (timeoutError.message.includes('timeout')) {
-          logger.warn(`Page load timeout for ${url}, taking screenshot anyway`);
-        } else {
-          throw timeoutError;
+        
+        logger.info(`Screenshot saved to ${screenshotPath}`);
+        return screenshotPath;
+        
+      } catch (error) {
+        logger.error(`Error taking screenshot of ${url} (attempt ${retries + 1}/${maxRetries + 1}): ${error.message}`);
+        
+        retries++;
+        
+        if (retries > maxRetries) {
+          logger.error(`Failed to take screenshot of ${url} after ${maxRetries + 1} attempts`);
+          return null;
+        }
+        
+        // If there was an error, wait a bit before retrying
+        logger.info(`Waiting 5 seconds before retry ${retries}/${maxRetries}`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // If browser crashed during screenshot, reinitialize
+        if (!this.browser) {
+          logger.info('Browser appears to be disconnected, reinitializing before retry...');
+          
+          try {
+            await this.initialize();
+          } catch (initError) {
+            logger.error(`Failed to reinitialize browser: ${initError.message}`);
+            return null;
+          }
         }
       }
-      
-      // Wait a bit for any dynamic content to load
-      await page.waitForTimeout(2000);
-      
-      // Handle common popups and overlays
-      await this.handleCommonPopups(page, domain);
-      
-      // Wait a bit more after handling popups
-      await page.waitForTimeout(1000);
-      
-      // Take screenshot
-      const screenshotPath = path.join(screenshotsDir, `${itemId}_${Date.now()}.jpg`);
-      await page.screenshot({ path: screenshotPath, type: 'jpeg', quality: 80 });
-      
-      logger.info(`Screenshot saved to ${screenshotPath}`);
-      return screenshotPath;
-    } catch (error) {
-      logger.error(`Error taking screenshot of ${url}: ${error.message}`);
-      return null;
     }
+    
+    // This should not be reached due to the return in the final retry, but just in case
+    return null;
   }
 
   /**
