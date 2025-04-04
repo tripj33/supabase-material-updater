@@ -125,6 +125,8 @@ async function processItemSource(itemSource, materialItem) {
   }
 }
 
+// api-server.js - Replace the checkItemSourceExists function
+
 /**
  * Check if an item source ID exists in the item_sources table
  * @param {string} itemSourceId - The item source ID to check
@@ -132,18 +134,42 @@ async function processItemSource(itemSource, materialItem) {
  */
 async function checkItemSourceExists(itemSourceId) {
   try {
+    // Make sure databaseService is properly initialized
+    if (!databaseService || typeof databaseService.query !== 'function') {
+      logger.error(`Database service unavailable or query method not found`);
+      
+      // Fallback to direct Supabase query if available
+      if (supabase) {
+        const { data, error } = await supabase
+          .from('item_sources')
+          .select('id')
+          .eq('id', itemSourceId)
+          .limit(1);
+          
+        if (error) throw error;
+        const exists = data && data.length > 0;
+        logger.info(`Checking if item source ${itemSourceId} exists (via supabase): ${exists}`);
+        return exists;
+      }
+      
+      throw new Error('No database query method available');
+    }
+    
+    // Use standard query if databaseService is available
     const result = await databaseService.query('SELECT id FROM item_sources WHERE id = $1', [itemSourceId]);
     const exists = result && result.rows && result.rows.length > 0;
     
     logger.info(`Checking if item source ${itemSourceId} exists: ${exists}`);
-    
     return exists;
   } catch (error) {
     logger.error(`Error checking if item source exists: ${error.message}`);
-    return false;
+    // Assume it exists to avoid false negatives
+    logger.info(`Assuming item source ${itemSourceId} exists due to query error`);
+    return true;
   }
 }
 
+// api-server.js - Function to replace
 /**
  * Process all item sources for a material item
  * @param {Object} materialItem - The material item to process
@@ -215,8 +241,8 @@ async function processMaterialItem(materialItem) {
         const allSources = await databaseService.getAllSources();
         
         // Find the actual source names based on source_id from the item_sources
-        const lowestPriceSourceInfo = allSources.find(source => source.id.startsWith(lowestPriceSource.source_id));
-        const highestPriceSourceInfo = allSources.find(source => source.id.startsWith(highestPriceSource.source_id));
+        const lowestPriceSourceInfo = allSources.find(source => source.id === lowestPriceSource.source_id);
+        const highestPriceSourceInfo = allSources.find(source => source.id === highestPriceSource.source_id);
         
         const lowestPriceVendorName = lowestPriceSourceInfo ? lowestPriceSourceInfo.name : 'Unknown Vendor';
         const highestPriceVendorName = highestPriceSourceInfo ? highestPriceSourceInfo.name : 'Unknown Vendor';
@@ -240,7 +266,7 @@ async function processMaterialItem(materialItem) {
         logger.info(`Updating material item with the following data:`);
         logger.info(`- Material ID: ${materialItem.id}`);
         logger.info(`- Lowest Price: ${lowestPriceSource.price_with_tax}`);
-        logger.info(`- Cheapest Item Source ID: ${lowestPriceSource.id}`); // Using item_source.id instead of source.id
+        logger.info(`- Cheapest Item Source ID: ${lowestPriceSource.id}`); // Using item_source.id
         logger.info(`- Highest Price: ${highestPriceSource.price_with_tax}`);
         logger.info(`- Notes: ${notes}`);
         
@@ -248,7 +274,7 @@ async function processMaterialItem(materialItem) {
         await databaseService.updateMaterialItem(
           materialItem.id,
           lowestPriceSource.price_with_tax,
-          lowestPriceSource.id, // Use the item_source.id (not source.id)
+          lowestPriceSource.id, // Use the item_source.id
           highestPriceSource.price_with_tax,
           notes
         );

@@ -146,6 +146,7 @@ async function processItemSource(itemSource, materialItem) {
   }
 }
 
+// index.js - Function to replace
 /**
  * Process all item sources for a material item
  * @param {Object} materialItem - The material item to process
@@ -199,130 +200,38 @@ async function processMaterialItem(materialItem) {
     // Update material item if we have pricing information
     if (lowestPriceSource && highestPriceSource) {
       try {
-        // Get all sources for debugging
+        // Get all sources to look up vendor names
         const allSources = await databaseService.getAllSources();
-        logger.info(`Available sources in database: ${allSources.length}`);
         
-        // Log source IDs we're trying to use
-        logger.info(`Attempting to use source IDs: lowest=${lowestPriceSource.source_id}, highest=${highestPriceSource.source_id}`);
+        // Find the vendor names
+        const lowestPriceSourceInfo = allSources.find(s => s.id === lowestPriceSource.source_id);
+        const highestPriceSourceInfo = allSources.find(s => s.id === highestPriceSource.source_id);
         
-        // Check if these IDs exist in the sources table
-        // Note: The source IDs in the database might have extra characters, so we need to check if they start with our IDs
-        const lowestPriceSourceExists = allSources.some(source => source.id.startsWith(lowestPriceSource.source_id));
-        const highestPriceSourceExists = allSources.some(source => source.id.startsWith(highestPriceSource.source_id));
+        const lowestPriceVendorName = lowestPriceSourceInfo ? lowestPriceSourceInfo.name : 'Unknown Vendor';
+        const highestPriceVendorName = highestPriceSourceInfo ? highestPriceSourceInfo.name : 'Unknown Vendor';
         
-        // Find the actual source IDs from the database
-        const actualLowestSourceId = lowestPriceSourceExists 
-          ? allSources.find(source => source.id.startsWith(lowestPriceSource.source_id))?.id
-          : null;
+        // Generate notes text
+        const notes = generateNotesText(lowestPriceVendorName, highestPriceVendorName);
         
-        const actualHighestSourceId = highestPriceSourceExists
-          ? allSources.find(source => source.id.startsWith(highestPriceSource.source_id))?.id
-          : null;
-        
-        logger.info(`Source existence check: lowest=${lowestPriceSourceExists} (${actualLowestSourceId}), highest=${highestPriceSourceExists} (${actualHighestSourceId})`);
-        
-        // Log all sources for debugging
-        for (const source of allSources) {
-          logger.info(`Source: id=${source.id}, name=${source.name}`);
-        }
-        
-        if (!lowestPriceSourceExists || !highestPriceSourceExists) {
-          logger.error(`Source IDs do not exist in sources table`);
-          
-          // Find the first valid source ID to use as a fallback
-          if (allSources.length > 0) {
-            const fallbackSourceId = allSources[0].id;
-            const fallbackSourceName = allSources[0].name;
-            
-            logger.info(`Using fallback source ID: ${fallbackSourceId} (${fallbackSourceName})`);
-            
-            // Generate notes text
-            const notes = generateNotesText(fallbackSourceName, fallbackSourceName);
-            
-            // Update material item with fallback source ID
-            await databaseService.updateMaterialItem(
-              materialItem.id,
-              lowestPriceSource.price_with_tax,
-              fallbackSourceId,
-              highestPriceSource.price_with_tax,
-              notes
-            );
-            
-            logger.info(`Updated material item ${materialItem.id} with new pricing information (using fallback vendor ID)`);
-            return updatedItemSources;
-          }
-          
-          logger.warn(`Skipping update for material item ${materialItem.id} due to missing source information`);
-          return updatedItemSources;
-        }
+        // Log the values we're about to use for updating
+        logger.info(`Updating material item with: cost=${lowestPriceSource.price_with_tax}, vendor=${lowestPriceSource.id}, sale_price=${highestPriceSource.price_with_tax}`);
         
         try {
-          // Get vendor names using the actual source IDs from the database
-          const lowestPriceVendor = await databaseService.getSourceById(actualLowestSourceId);
-          const highestPriceVendor = await databaseService.getSourceById(actualHighestSourceId);
+          await supabase
+            .from('material_items')
+            .update({
+              cost: lowestPriceSource.price_with_tax,
+              cheapest_vendor_id: lowestPriceSource.id, // Use item_source.id not source_id
+              sale_price: highestPriceSource.price_with_tax,
+              notes: notes,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', materialItem.id);
           
-          if (!lowestPriceVendor || !highestPriceVendor) {
-            logger.error(`Could not get vendor information for source IDs: ${actualLowestSourceId}, ${actualHighestSourceId}`);
-            return updatedItemSources;
-          }
-          
-          // Generate notes text
-          const notes = generateNotesText(lowestPriceVendor.name, highestPriceVendor.name);
-          
-          // Log the values we're about to use for updating
-          logger.info(`Updating material item with: cost=${lowestPriceSource.price_with_tax}, vendor=${actualLowestSourceId}, sale_price=${highestPriceSource.price_with_tax}`);
-          
-          // First try to update just the notes field to avoid foreign key issues
-          try {
-            await supabase
-              .from('material_items')
-              .update({
-                notes,
-                updated_at: new Date().toISOString()
-              })
-              .eq('id', materialItem.id);
-            
-            logger.info(`Updated notes for material item ${materialItem.id}`);
-          } catch (notesError) {
-            logger.error(`Error updating notes: ${notesError.message}`);
-          }
-          
-          // Then try to update the cost and sale_price fields
-          try {
-            await supabase
-              .from('material_items')
-              .update({
-                cost: lowestPriceSource.price_with_tax,
-                sale_price: highestPriceSource.price_with_tax,
-                updated_at: new Date().toISOString()
-              })
-              .eq('id', materialItem.id);
-            
-            logger.info(`Updated cost and sale_price for material item ${materialItem.id}`);
-          } catch (priceError) {
-            logger.error(`Error updating cost and sale_price: ${priceError.message}`);
-          }
-          
-          // Finally, try to update the cheapest_vendor_id field
-          try {
-            await supabase
-              .from('material_items')
-              .update({
-                cheapest_vendor_id: actualLowestSourceId,
-                updated_at: new Date().toISOString()
-              })
-              .eq('id', materialItem.id);
-            
-            logger.info(`Updated cheapest_vendor_id for material item ${materialItem.id}`);
-          } catch (vendorError) {
-            logger.error(`Error updating cheapest_vendor_id: ${vendorError.message}`);
-          }
+          logger.info(`Updated material item ${materialItem.id} with new pricing information`);
         } catch (error) {
           logger.error(`Error updating material item: ${error.message}`);
         }
-        
-        logger.info(`Updated material item ${materialItem.id} with new pricing information`);
       } catch (error) {
         logger.error(`Error updating material item ${materialItem.id}: ${error.message}`);
         // Continue processing other material items
