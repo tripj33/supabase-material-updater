@@ -1,6 +1,6 @@
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -8,7 +8,10 @@ import { logger } from './src/utils/logger.js';
 import databaseService from './src/services/database.js';
 import scraperService from './src/services/scraper.js';
 import geminiService from './src/services/gemini.js';
+import browserPool from './src/services/browser-pool.js';
+import sessionManager from './src/services/session-manager.js';
 import { generateNotesText } from './src/utils/date-formatter.js';
+import { TaskQueue } from './src/utils/task-queue.js';
 
 // Add stealth plugin to puppeteer
 puppeteer.use(StealthPlugin());
@@ -21,56 +24,317 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const screenshotsDir = path.join(__dirname, 'screenshots');
 
 // Ensure screenshots directory exists
-if (!fs.existsSync(screenshotsDir)) {
-  fs.mkdirSync(screenshotsDir, { recursive: true });
+(async function() {
+  if (!fs.existsSync(screenshotsDir)) {
+    await fs.mkdir(screenshotsDir, { recursive: true });
+  }
+})();
+
+// Price change threshold (percentage)
+const PRICE_CHANGE_THRESHOLD = parseInt(process.env.PRICE_CHANGE_THRESHOLD || '30', 10);
+
+// Recovery system state
+let processingQueue = [];
+let currentIndex = 0;
+let isRecovering = false;
+let recoveryAttempts = 0;
+const MAX_RECOVERY_ATTEMPTS = 5;
+const RECOVERY_WAIT_TIME = 60000; // 60 seconds
+
+// Initialize services
+let isInitialized = false;
+let taskQueue = null;
+
+/**
+ * Initialize services required for processing
+ */
+export async function initialize() {
+  if (isInitialized) return;
+  
+  await browserPool.initialize();
+  await sessionManager.initialize();
+  taskQueue = new TaskQueue({ concurrency: 3 });
+  
+  // Register disconnect handler
+  if (typeof browserPool.setDisconnectHandler === 'function') {
+    browserPool.setDisconnectHandler(() => {
+      if (!isRecovering) {
+        logger.warn("Browser disconnect detected through event handler");
+      }
+    });
+  }
+  
+  isInitialized = true;
+  logger.info('Price scraper services initialized');
 }
 
-// Track outdated URLs
-const outdatedUrls = [];
+/**
+ * Clean up and release resources
+ */
+export async function cleanup() {
+  if (!isInitialized) return;
+  
+  logger.info('Performing cleanup...');
+  
+  try {
+    await scraperService.cleanupScreenshots();
+  } catch (error) {
+    logger.error(`Error cleaning screenshots: ${error.message}`);
+  }
+  
+  try {
+    await browserPool.close();
+  } catch (error) {
+    logger.error(`Error closing browser pool: ${error.message}`);
+  }
+  
+  isInitialized = false;
+  logger.info('Price scraper services cleaned up');
+}
+
+/**
+ * Handle unexpected browser disconnection and recover processing
+ * @param {Array} items - Array of material items
+ * @param {number} startIndex - Index to resume from
+ * @returns {Promise<Object>} Processing results
+ */
+async function recoverFromDisconnection(items, startIndex) {
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    logger.error(`Exceeded maximum recovery attempts (${MAX_RECOVERY_ATTEMPTS}). Stopping process.`);
+    return { 
+      success: false, 
+      error: "Exceeded maximum recovery attempts",
+      processed: startIndex,
+      total: items.length
+    };
+  }
+
+  logger.info(`Browser disconnected unexpectedly. Recovery attempt ${recoveryAttempts + 1}/${MAX_RECOVERY_ATTEMPTS}`);
+  logger.info(`Waiting ${RECOVERY_WAIT_TIME/1000} seconds before attempting to recover...`);
+  
+  // Wait for recovery time
+  await new Promise(resolve => setTimeout(resolve, RECOVERY_WAIT_TIME));
+  
+  isRecovering = true;
+  recoveryAttempts++;
+  
+  try {
+    // Make sure browser is closed
+    await browserPool.close().catch(() => {});
+    
+    // Reinitialize browser
+    logger.info("Reinitializing browser after disconnection...");
+    await browserPool.initialize();
+    
+    // Resume processing from the last material item
+    logger.info(`Resuming processing from index ${startIndex} of ${items.length} items`);
+    
+    // Continue processing
+    const result = await processRemainingItems(items, startIndex);
+    
+    // Reset recovery state if all items were processed
+    if (startIndex + result.success + result.failed >= items.length) {
+      isRecovering = false;
+      recoveryAttempts = 0;
+    }
+    
+    return result;
+  } catch (error) {
+    logger.error(`Error during recovery: ${error.message}`);
+    // If error is browser-related, try recovery again
+    if (error.message.includes("disconnected") || 
+        error.message.includes("Target closed") || 
+        error.message.includes("Session closed") ||
+        error.message.includes("Protocol error")) {
+      return recoverFromDisconnection(items, startIndex);
+    }
+    return {
+      success: false,
+      error: error.message,
+      processed: startIndex,
+      total: items.length
+    };
+  }
+}
+
+/**
+ * Process remaining items from specified index
+ * @param {Array} items - Array of material items
+ * @param {number} startIndex - Index to start from
+ * @returns {Promise<Object>} Processing results
+ */
+async function processRemainingItems(items, startIndex) {
+  const results = {
+    success: 0,
+    failed: 0,
+    skipped: 0,
+    outdated: 0,
+    materialUpdates: 0,
+    details: [],
+    updatedItemSources: []
+  };
+  
+  for (let i = startIndex; i < items.length; i++) {
+    currentIndex = i;
+    const item = items[i];
+    
+    try {
+      // Verify browser is connected
+      if (!browserPool.browser) {
+        logger.warn("Browser is not connected, attempting recovery...");
+        const recoveryResults = await recoverFromDisconnection(items, i);
+        // Merge results
+        results.success += recoveryResults.success || 0;
+        results.failed += recoveryResults.failed || 0;
+        results.skipped += recoveryResults.skipped || 0;
+        results.outdated += recoveryResults.outdated || 0;
+        if (recoveryResults.details) {
+          results.details.push(...recoveryResults.details);
+        }
+        if (recoveryResults.updatedItemSources) {
+          results.updatedItemSources.push(...recoveryResults.updatedItemSources);
+        }
+        return results;
+      }
+      
+      // Process material item
+      logger.info(`Processing item ${i + 1}/${items.length}: ${item.id}`);
+      const result = await processMaterialItem(item);
+      
+      if (result.success) {
+        results.success++;
+        if (result.updatedItemSources) {
+          results.updatedItemSources.push(...result.updatedItemSources);
+        }
+      } else {
+        results.failed++;
+        if (result.outdatedUrls && result.outdatedUrls.length > 0) {
+          results.outdated += result.outdatedUrls.length;
+        }
+      }
+      
+      results.details.push(result);
+      
+    } catch (error) {
+      // Check for browser disconnection
+      if (error.message.includes("disconnected") || 
+          error.message.includes("Target closed") || 
+          error.message.includes("Session closed") ||
+          error.message.includes("Protocol error") ||
+          !browserPool.browser) {
+        
+        logger.error(`Browser disconnection detected: ${error.message}`);
+        const recoveryResults = await recoverFromDisconnection(items, i);
+        // Merge results
+        results.success += recoveryResults.success || 0;
+        results.failed += recoveryResults.failed || 0;
+        results.skipped += recoveryResults.skipped || 0;
+        results.outdated += recoveryResults.outdated || 0;
+        if (recoveryResults.details) {
+          results.details.push(...recoveryResults.details);
+        }
+        if (recoveryResults.updatedItemSources) {
+          results.updatedItemSources.push(...recoveryResults.updatedItemSources);
+        }
+        return results;
+      }
+      
+      logger.error(`Error processing item ${item.id}: ${error.message}`);
+      results.failed++;
+      results.details.push({
+        success: false,
+        materialItemId: item.id,
+        materialItemName: item.name,
+        error: error.message
+      });
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Group item sources by domain to optimize processing
+ * @param {Array} materialItems - Array of material items
+ * @returns {Promise<Object>} Object with domains as keys and arrays of {item, source} pairs as values
+ */
+export async function groupItemSourcesByDomain(materialItems) {
+  const itemsByDomain = {};
+  
+  for (const item of materialItems) {
+    const sources = await databaseService.fetchItemSources(item.id);
+    
+    for (const source of sources) {
+      try {
+        const url = new URL(source.url);
+        const domain = url.hostname;
+        
+        if (!itemsByDomain[domain]) {
+          itemsByDomain[domain] = [];
+        }
+        
+        itemsByDomain[domain].push({ item, source });
+      } catch (error) {
+        logger.error(`Invalid URL for item source ${source.id}: ${source.url}`);
+      }
+    }
+  }
+  
+  return itemsByDomain;
+}
 
 /**
  * Process a single item source
- * @param {Object} itemSource - The item source to process
- * @param {Object} materialItem - The material item
- * @returns {Promise<Object|null>} Updated item source or null if failed
+ * @param {Object} source - Item source to process
+ * @param {Object} item - Material item
+ * @returns {Promise<Object>} Processing result
  */
-async function processItemSource(itemSource, materialItem) {
+export async function processItemSource(source, item) {
+  const result = {
+    id: source.id,
+    materialItemId: item.id,
+    materialItemName: item.name,
+    success: false,
+    outdated: false,
+    priceChange: null,
+    oldPrice: source.sale_price,
+    newPrice: null,
+    error: null
+  };
+  
   try {
-    logger.info(`Processing item source ${itemSource.id} for material item ${materialItem.id}`);
-    
+    // Check browser connection first
+    if (!browserPool.browser) {
+      throw new Error("Browser disconnected before processing item source");
+    }
+
     // Take screenshot of the product page
-    const screenshotPath = await scraperService.takeScreenshot(itemSource.url, itemSource.id);
+    const screenshotPath = await scraperService.takeScreenshot(source.url, source.id);
     
     if (!screenshotPath) {
-      logger.error(`Failed to take screenshot for item source ${itemSource.id}`);
-      await databaseService.markUrlAsOutdated(itemSource.id);
-      outdatedUrls.push({
-        id: itemSource.id,
-        url: itemSource.url,
-        materialItemName: materialItem.name
-      });
-      return null;
+      logger.error(`Failed to take screenshot for item source ${source.id}`);
+      await databaseService.markUrlAsOutdated(source.id);
+      result.outdated = true;
+      result.error = "Failed to take screenshot";
+      return result;
     }
     
     // Extract price from screenshot
-    const price = await geminiService.extractPriceFromImage(screenshotPath, materialItem.name);
+    const price = await geminiService.extractPriceFromImage(screenshotPath, item.name);
     
     // Clean up screenshot
     try {
-      await fs.promises.unlink(screenshotPath);
+      await fs.unlink(screenshotPath);
     } catch (error) {
       logger.warn(`Failed to delete screenshot ${screenshotPath}: ${error.message}`);
     }
     
     if (price === null) {
-      logger.error(`Failed to extract price for item source ${itemSource.id}`);
-      await databaseService.markUrlAsOutdated(itemSource.id);
-      outdatedUrls.push({
-        id: itemSource.id,
-        url: itemSource.url,
-        materialItemName: materialItem.name
-      });
-      return null;
+      logger.error(`Failed to extract price for item source ${source.id}`);
+      await databaseService.markUrlAsOutdated(source.id);
+      result.outdated = true;
+      result.error = "Failed to extract price";
+      return result;
     }
     
     // Calculate price with tax and round to two decimal places
@@ -78,154 +342,217 @@ async function processItemSource(itemSource, materialItem) {
     const priceWithTax = Math.round((roundedPrice * 1.15) * 100) / 100;
     
     // Check for significant price change
-    if (itemSource.sale_price !== null) {
-      const percentChange = Math.abs((price - itemSource.sale_price) / itemSource.sale_price * 100);
+    if (source.sale_price !== null) {
+      const percentChange = Math.abs((price - source.sale_price) / source.sale_price * 100);
       
-      if (percentChange > 30) {
-        const vendorName = itemSource.sources ? itemSource.sources.name : 'Unknown Vendor';
+      if (percentChange > PRICE_CHANGE_THRESHOLD) {
+        const vendorName = source.sources ? source.sources.name : 'Unknown Vendor';
         logger.info(
-          `Significant price change detected for ${materialItem.name} from ${vendorName}: ` +
-          `${itemSource.sale_price} -> ${price} (${percentChange.toFixed(2)}%)`
+          `Significant price change detected for ${item.name} from ${vendorName}: ` +
+          `${source.sale_price} -> ${price} (${percentChange.toFixed(2)}%)`
         );
+        
+        result.priceChange = {
+          percentChange: percentChange.toFixed(2),
+          vendor: vendorName
+        };
       }
     }
     
     // Update item source with new pricing
-    const updatedItemSource = await databaseService.updateItemSource(itemSource.id, price, priceWithTax);
+    const updatedItemSource = await databaseService.updateItemSource(source.id, price, priceWithTax);
     
-    logger.info(`Updated item source ${itemSource.id} with price ${price} (${priceWithTax} with tax)`);
-    return updatedItemSource;
+    logger.info(`Updated item source ${source.id} with price ${price} (${priceWithTax} with tax)`);
+    
+    // Update result
+    result.success = true;
+    result.newPrice = price;
+    result.priceWithTax = priceWithTax;
+    result.updatedItemSource = updatedItemSource;
+    
+    return result;
   } catch (error) {
-    logger.error(`Error processing item source ${itemSource.id}: ${error.message}`);
-    return null;
+    // Enhanced error detection
+    if (error.message.includes("disconnected") || 
+        error.message.includes("Target closed") || 
+        error.message.includes("Session closed") ||
+        error.message.includes("Protocol error") ||
+        !browserPool.browser) {
+      
+      throw new Error(`Browser disconnection during item source processing: ${error.message}`);
+    }
+    
+    logger.error(`Error processing item source ${source.id}: ${error.message}`);
+    result.error = error.message;
+    return result;
   }
 }
 
 /**
- * Group item sources by domain
- * @param {Array} itemSources - Array of item sources
- * @returns {Object} Object with domains as keys and arrays of item sources as values
+ * Process item sources for a specific domain
+ * @param {string} domain - Domain name
+ * @param {Array} itemSourcePairs - Array of {item, source} pairs
+ * @returns {Promise<Object>} Processing results
  */
-function groupItemSourcesByDomain(itemSources) {
-  const groups = {};
+export async function processDomainItems(domain, itemSourcePairs) {
+  logger.info(`Processing ${itemSourcePairs.length} items for domain ${domain}`);
   
-  for (const source of itemSources) {
-    try {
-      const url = new URL(source.url);
-      const domain = url.hostname;
+  const results = {
+    domain,
+    success: 0,
+    failed: 0,
+    outdated: 0,
+    priceChanges: [],
+    items: [],
+    outdatedUrls: []
+  };
+  
+  // Batch process arrays for database operations
+  const updateBatch = [];
+  const outdatedBatch = [];
+  
+  // Process each item source
+  for (const { item, source } of itemSourcePairs) {
+    // Check browser connection
+    if (!browserPool.browser) {
+      throw new Error("Browser disconnected during domain processing");
+    }
+    
+    const sourceResult = await processItemSource(source, item);
+    results.items.push(sourceResult);
+    
+    if (sourceResult.success) {
+      results.success++;
+      updateBatch.push({
+        id: source.id,
+        salePrice: sourceResult.newPrice,
+        priceWithTax: sourceResult.priceWithTax,
+        source_id: source.source_id,
+        item_id: item.id
+      });
       
-      if (!groups[domain]) {
-        groups[domain] = [];
+      if (sourceResult.priceChange) {
+        results.priceChanges.push({
+          materialName: item.name,
+          vendor: sourceResult.priceChange.vendor,
+          oldPrice: sourceResult.oldPrice,
+          newPrice: sourceResult.newPrice,
+          percentChange: sourceResult.priceChange.percentChange
+        });
       }
+    } else {
+      results.failed++;
       
-      groups[domain].push(source);
-    } catch (error) {
-      logger.error(`Invalid URL for item source ${source.id}: ${source.url}`);
+      if (sourceResult.outdated) {
+        results.outdated++;
+        outdatedBatch.push(source.id);
+        results.outdatedUrls.push({
+          id: source.id,
+          url: source.url,
+          materialItemName: item.name
+        });
+      }
     }
   }
   
-  return groups;
-}
-
-/**
- * Test database connection
- * @returns {Promise<boolean>} Connection success status
- */
-async function testDatabaseConnection() {
-  try {
-    logger.info('Testing database connection...');
-    
-    // Query a simple table
-    const result = await databaseService.query('SELECT COUNT(*) FROM item_sources');
-    
-    logger.info(`Database connection test successful. Found ${result.rows[0].count} item sources.`);
-    return true;
-  } catch (error) {
-    logger.error(`Database connection test failed: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-    return false;
+  // Batch update outdated URLs
+  if (outdatedBatch.length > 0) {
+    await databaseService.batchMarkUrlsAsOutdated(outdatedBatch);
+    logger.info(`Marked ${outdatedBatch.length} URLs as outdated for domain ${domain}`);
   }
-}
-
-/**
- * Verify a UUID exists directly in the database
- * @param {string} uuid - The UUID to check
- * @returns {Promise<boolean>} Whether the UUID exists
- */
-async function verifyUuidExists(uuid) {
-  try {
-    logger.info(`Directly verifying UUID ${uuid} exists in database...`);
-    const result = await databaseService.query('SELECT EXISTS(SELECT 1 FROM item_sources WHERE id = $1)', [uuid]);
-    const exists = result.rows[0].exists;
-    logger.info(`Direct verification: UUID ${uuid} exists in database: ${exists}`);
-    return exists;
-  } catch (error) {
-    logger.error(`Error during direct UUID verification: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-    return false;
+  
+  // Batch update item sources
+  if (updateBatch.length > 0) {
+    await databaseService.batchUpdateItemSources(updateBatch);
+    logger.info(`Updated ${updateBatch.length} item sources for domain ${domain}`);
   }
+  
+  return results;
 }
 
-// price-scraper.js - Replace the checkItemSourceExists function
-
 /**
- * Check if an item source ID exists in the item_sources table
- * @param {string} itemSourceId - The item source ID to check
- * @returns {Promise<boolean>} Whether the item source exists
+ * Process material item updates after item sources have been updated
+ * @param {Array} itemSourceUpdates - Updated item sources
+ * @returns {Promise<Array>} Updated material items
  */
-async function checkItemSourceExists(itemSourceId) {
-  try {
-    logger.info(`Checking if item source ${itemSourceId} exists in database...`);
-    
-    // Check if databaseService is properly initialized
-    if (!databaseService || typeof databaseService.query !== 'function') {
-      logger.error(`Database service unavailable or query method not found`);
-      
-      // Fallback to direct Supabase query if available
-      if (supabase) {
-        const { data, error } = await supabase
-          .from('item_sources')
-          .select('id')
-          .eq('id', itemSourceId)
-          .limit(1);
-          
-        if (error) throw error;
-        const exists = data && data.length > 0;
-        logger.info(`Item source ${itemSourceId} exists (via supabase): ${exists}`);
-        return exists;
-      }
-      
-      // If we can't query, assume it exists to avoid false negatives
-      logger.info(`No database access method available. Assuming item source ${itemSourceId} exists.`);
-      return true;
+export async function updateMaterialItems(itemSourceUpdates) {
+  if (itemSourceUpdates.length === 0) {
+    logger.warn('No item sources were updated, skipping material item updates');
+    return [];
+  }
+  
+  // Group by material item ID
+  const itemUpdates = {};
+  
+  for (const source of itemSourceUpdates) {
+    if (!itemUpdates[source.item_id]) {
+      itemUpdates[source.item_id] = {
+        id: source.item_id,
+        sources: []
+      };
     }
     
-    // Use standard query if databaseService is available
-    const result = await databaseService.query('SELECT id FROM item_sources WHERE id = $1', [itemSourceId]);
-    const exists = result && result.rows && result.rows.length > 0;
-    
-    logger.info(`Item source ${itemSourceId} exists: ${exists}`);
-    return exists;
-  } catch (error) {
-    logger.error(`Error checking if item source exists: ${error.message}`);
-    // Assume it exists to avoid false negatives
-    logger.info(`Assuming item source ${itemSourceId} exists due to query error`);
-    return true;
+    itemUpdates[source.item_id].sources.push(source);
   }
+  
+  // Find lowest and highest prices for each material item
+  const materialUpdates = [];
+  
+  // Get all sources for vendor names
+  const allSources = await databaseService.getAllSources();
+  
+  for (const [itemId, data] of Object.entries(itemUpdates)) {
+    if (data.sources.length === 0) continue;
+    
+    // Sort sources by price
+    data.sources.sort((a, b) => a.priceWithTax - b.priceWithTax);
+    
+    const lowestPriceSource = data.sources[0];
+    const highestPriceSource = data.sources[data.sources.length - 1];
+    
+    // Get vendor names
+    const lowestPriceVendorInfo = allSources.find(s => s.id === lowestPriceSource.source_id);
+    const highestPriceVendorInfo = allSources.find(s => s.id === highestPriceSource.source_id);
+    
+    const lowestPriceVendorName = lowestPriceVendorInfo ? lowestPriceVendorInfo.name : 'Unknown Vendor';
+    const highestPriceVendorName = highestPriceVendorInfo ? highestPriceVendorInfo.name : 'Unknown Vendor';
+    
+    // Generate notes text
+    const notes = generateNotesText(lowestPriceVendorName, highestPriceVendorName);
+    
+    // Add to material updates
+    materialUpdates.push({
+      id: itemId,
+      cost: lowestPriceSource.priceWithTax,
+      cheapestVendorId: lowestPriceSource.id,
+      salePrice: highestPriceSource.priceWithTax,
+      notes: notes,
+      lowestPriceVendorName,
+      highestPriceVendorName
+    });
+  }
+  
+  // Batch update material items
+  if (materialUpdates.length > 0) {
+    await databaseService.batchUpdateMaterialItems(materialUpdates);
+    logger.info(`Updated ${materialUpdates.length} material items with new pricing information`);
+  }
+  
+  return materialUpdates;
 }
 
-// price-scraper.js - Function to replace
 /**
- * Process all item sources for a material item
- * @param {Object} materialItem - The material item to process
- * @returns {Promise<Object>} Result of processing
+ * Process a single material item
+ * @param {Object} materialItem - Material item to process
+ * @returns {Promise<Object>} Processing results
  */
-async function processMaterialItem(materialItem) {
+export async function processMaterialItem(materialItem) {
   try {
+    if (!isInitialized) {
+      await initialize();
+    }
+    
     logger.info(`Processing material item ${materialItem.id}: ${materialItem.name}`);
-    
-    // Test database connection first
-    await testDatabaseConnection();
     
     // Fetch item sources for this material item
     const itemSources = await databaseService.fetchItemSources(materialItem.id);
@@ -240,149 +567,97 @@ async function processMaterialItem(materialItem) {
     }
     
     // Group item sources by domain
-    const domainGroups = groupItemSourcesByDomain(itemSources);
+    const itemsByDomain = {};
+    for (const source of itemSources) {
+      try {
+        const url = new URL(source.url);
+        const domain = url.hostname;
+        
+        if (!itemsByDomain[domain]) {
+          itemsByDomain[domain] = [];
+        }
+        
+        itemsByDomain[domain].push({ item: materialItem, source });
+      } catch (error) {
+        logger.error(`Invalid URL for item source ${source.id}: ${source.url}`);
+      }
+    }
     
     // Process each domain group
+    const domainResults = [];
     const updatedItemSources = [];
+    const outdatedUrls = [];
     
-    for (const [domain, sources] of Object.entries(domainGroups)) {
-      logger.info(`Processing ${sources.length} item sources for domain ${domain}`);
-      
-      // Process each item source in this domain group
-      for (const source of sources) {
-        const updatedSource = await processItemSource(source, materialItem);
-        
-        if (updatedSource) {
-          updatedItemSources.push(updatedSource);
-        }
-      }
-    }
-    
-    // Find lowest and highest priced item sources
-    let lowestPriceSource = null;
-    let highestPriceSource = null;
-    
-    for (const source of updatedItemSources) {
-      if (!lowestPriceSource || source.price_with_tax < lowestPriceSource.price_with_tax) {
-        lowestPriceSource = source;
-      }
-      
-      if (!highestPriceSource || source.price_with_tax > highestPriceSource.price_with_tax) {
-        highestPriceSource = source;
-      }
-    }
-    
-    // Update material item if we have pricing information
-    if (lowestPriceSource && highestPriceSource) {
+    for (const [domain, pairs] of Object.entries(itemsByDomain)) {
       try {
-        // Log all available item sources for debugging
-        logger.info(`Available item sources in database:`);
-        updatedItemSources.forEach(source => {
-          logger.info(`Item Source ID: ${source.id}, Source ID: ${source.source_id}, Price: ${source.price_with_tax}`);
+        const result = await processDomainItems(domain, pairs);
+        domainResults.push(result);
+        
+        // Collect successful item source updates for material item update
+        result.items.forEach(item => {
+          if (item.success) {
+            updatedItemSources.push({
+              id: item.id,
+              salePrice: item.newPrice,
+              priceWithTax: item.priceWithTax,
+              source_id: item.updatedItemSource.source_id,
+              item_id: materialItem.id
+            });
+          }
         });
         
-        // Log details about the chosen item sources
-        logger.info(`Lowest price item source details: ID=${lowestPriceSource.id}, Price=${lowestPriceSource.price_with_tax}`);
-        logger.info(`Highest price item source details: ID=${highestPriceSource.id}, Price=${highestPriceSource.price_with_tax}`);
-        
-        // Get all sources for reference
-        const allSources = await databaseService.getAllSources();
-        logger.info(`Got ${allSources.length} sources from database`);
-        
-        // Find the actual source objects
-        const lowestPriceSourceInfo = allSources.find(s => s.id === lowestPriceSource.source_id);
-        const highestPriceSourceInfo = allSources.find(s => s.id === highestPriceSource.source_id);
-        
-        if (!lowestPriceSourceInfo) {
-          logger.error(`Could not find source info for source_id ${lowestPriceSource.source_id}`);
-          return {
-            success: false,
-            message: `Could not find source info for lowest price source`,
-            materialItem,
-            updatedItemSources
-          };
+        // Collect outdated URLs
+        if (result.outdatedUrls && result.outdatedUrls.length > 0) {
+          outdatedUrls.push(...result.outdatedUrls);
         }
-        
-        if (!highestPriceSourceInfo) {
-          logger.error(`Could not find source info for source_id ${highestPriceSource.source_id}`);
-          return {
-            success: false,
-            message: `Could not find source info for highest price source`,
-            materialItem,
-            updatedItemSources
-          };
-        }
-        
-        const lowestPriceVendorName = lowestPriceSourceInfo.name;
-        const highestPriceVendorName = highestPriceSourceInfo.name;
-        
-        // Generate notes text
-        const notes = generateNotesText(lowestPriceVendorName, highestPriceVendorName);
-        
-        // Verify the item source ID exists in the item_sources table
-        const itemSourceExists = await checkItemSourceExists(lowestPriceSource.id);
-        if (!itemSourceExists) {
-          logger.error(`Cannot update cheapest_vendor_id: Item source ID ${lowestPriceSource.id} does not exist in item_sources table!`);
-          return {
-            success: false,
-            message: `Cannot update with item source - ID does not exist in item_sources table`,
-            materialItem,
-            updatedItemSources
-          };
-        }
-        
-        // Log the exact data being sent to update
-        logger.info(`Updating material item with the following data:`);
-        logger.info(`- Material ID: ${materialItem.id}`);
-        logger.info(`- Lowest Price: ${lowestPriceSource.price_with_tax}`);
-        logger.info(`- Cheapest Item Source ID: ${lowestPriceSource.id}`); // Using item_source.id
-        logger.info(`- Highest Price: ${highestPriceSource.price_with_tax}`);
-        logger.info(`- Notes: ${notes}`);
-        
-        // Update material item with the item_source.id (not the source.id)
-        await databaseService.updateMaterialItem(
-          materialItem.id,
-          lowestPriceSource.price_with_tax,
-          lowestPriceSource.id, // Use the item_source.id
-          highestPriceSource.price_with_tax,
-          notes
-        );
-        
-        logger.info(`Updated material item ${materialItem.id} with new pricing information`);
-        
-        return {
-          success: true,
-          message: `Updated material item ${materialItem.id} with new pricing information`,
-          materialItem,
-          updatedItemSources,
-          lowestPriceSource,
-          highestPriceSource
-        };
       } catch (error) {
-        logger.error(`Error updating material item: ${error.message}`);
-        logger.error(`Stack trace: ${error.stack}`);
+        // Check for browser disconnection
+        if (error.message.includes("disconnected") || 
+            error.message.includes("Target closed") || 
+            error.message.includes("Session closed") ||
+            error.message.includes("Protocol error") ||
+            !browserPool.browser) {
+          
+          throw new Error(`Browser disconnection during domain processing: ${error.message}`);
+        }
         
-        return {
-          success: false,
-          message: `Error updating material item: ${error.message}`,
-          materialItem,
-          updatedItemSources,
-          error: error.message
-        };
+        logger.error(`Error processing domain ${domain}: ${error.message}`);
       }
+    }
+    
+    // Update the material item if we have pricing information
+    const materialUpdates = await updateMaterialItems(updatedItemSources);
+    
+    // Find the update for this material item
+    const materialUpdate = materialUpdates.find(update => update.id === materialItem.id);
+    
+    if (materialUpdate) {
+      return {
+        success: true,
+        message: `Updated material item ${materialItem.id} with new pricing information`,
+        materialItem,
+        updatedItemSources,
+        outdatedUrls,
+        lowestPriceSource: {
+          id: materialUpdate.cheapestVendorId
+        },
+        highestPriceSource: {
+          price_with_tax: materialUpdate.salePrice
+        },
+        lowestPriceVendorName: materialUpdate.lowestPriceVendorName,
+        highestPriceVendorName: materialUpdate.highestPriceVendorName
+      };
     } else {
-      logger.warn(`Could not update material item ${materialItem.id} due to missing pricing information`);
-      
       return {
         success: false,
         message: `Could not update material item ${materialItem.id} due to missing pricing information`,
         materialItem,
-        updatedItemSources
+        updatedItemSources: updatedItemSources.length,
+        outdatedUrls
       };
     }
   } catch (error) {
     logger.error(`Error processing material item ${materialItem.id}: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
     
     return {
       success: false,
@@ -394,125 +669,169 @@ async function processMaterialItem(materialItem) {
 }
 
 /**
- * Main function to run the price scraper
- * @param {Object} options - Options for the scraper
- * @param {number} [options.limit] - Maximum number of material items to process
- * @param {string} [options.materialItemId] - Specific material item ID to process
+ * Process all material items in parallel
+ * @param {Object} options - Processing options
+ * @returns {Promise<Object>} Processing results
  */
-async function main(options = {}) {
-  const { limit, materialItemId } = options;
+export async function processAllMaterialItems(options = {}) {
+  const { limit, concurrency = 3 } = options;
   
   try {
-    logger.info('Starting price scraper');
-    
-    // Initialize scraper
-    await scraperService.initialize();
-    
-    // Login to all sites
-    const loginResults = {
-      winsupply: await scraperService.loginToWinSupply(),
-      homedepot: await scraperService.loginToHomeDepot(),
-      supplyhouse: await scraperService.loginToSupplyHouse(),
-      hdsupply: await scraperService.loginToHDSupply()
-    };
-    
-    logger.info('Login results:', loginResults);
-    
-    // Process material items
-    let materialItems;
-    
-    if (materialItemId) {
-      // Process a specific material item
-      materialItems = await databaseService.fetchMaterialItems();
-      materialItems = materialItems.filter(item => item.id === materialItemId);
-      
-      if (materialItems.length === 0) {
-        logger.error(`Material item with ID ${materialItemId} not found`);
-        await scraperService.close();
-        return;
-      }
-    } else {
-      // Process all material items (with optional limit)
-      materialItems = await databaseService.fetchMaterialItems(limit);
+    if (!isInitialized) {
+      await initialize();
     }
     
-    logger.info(`Processing ${materialItems.length} material items`);
-    
-    // Process each material item
-    const results = {
-      success: 0,
-      failed: 0,
-      skipped: 0,
-      details: []
-    };
-    
-    for (const item of materialItems) {
-      try {
-        const result = await processMaterialItem(item);
-        results.details.push(result);
-        
-        if (result.success) {
-          results.success++;
-        } else {
-          results.failed++;
-        }
-      } catch (error) {
-        logger.error(`Failed to process material item ${item.id}: ${error.message}`);
-        logger.error(`Stack trace: ${error.stack}`);
-        results.failed++;
-        results.details.push({
-          success: false,
-          message: `Failed to process material item ${item.id}: ${error.message}`,
-          materialItem: item,
-          error: error.message
-        });
-      }
+    // Create task queue if not already created
+    if (!taskQueue) {
+      taskQueue = new TaskQueue({ concurrency });
     }
     
-    // Log results
-    logger.info(`Processed ${materialItems.length} material items:`);
-    logger.info(`- Success: ${results.success}`);
-    logger.info(`- Failed: ${results.failed}`);
+    // Fetch all material items with optional limit
+    let materialItems = await databaseService.fetchMaterialItems(limit);
     
-    // Log outdated URLs
-    if (outdatedUrls.length > 0) {
-      logger.info(`Found ${outdatedUrls.length} outdated URLs:`);
-      for (const item of outdatedUrls) {
-        logger.info(`- ${item.materialItemName}: ${item.url} (ID: ${item.id})`);
-      }
+    logger.info(`Processing ${materialItems.length} material items with concurrency ${concurrency}`);
+    
+    // Reset processing state
+    currentIndex = 0;
+    recoveryAttempts = 0;
+    processingQueue = [...materialItems];
+    isRecovering = false;
+    
+    // Process items with recovery capability
+    const results = await processRemainingItems(materialItems, 0);
+    
+    // Update any material items if needed
+    let materialUpdates = [];
+    if (results.updatedItemSources && results.updatedItemSources.length > 0) {
+      materialUpdates = await updateMaterialItems(results.updatedItemSources);
+      results.materialUpdates = materialUpdates.length;
     }
     
     // Clean up
-    await scraperService.cleanupScreenshots();
-    await scraperService.close();
-    
-    logger.info('Price scraper completed');
-  } catch (error) {
-    logger.error(`Error running price scraper: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-    
-    // Ensure browser is closed even if there's an error
     try {
-      await scraperService.close();
-    } catch (closeError) {
-      logger.error(`Error closing browser: ${closeError.message}`);
+      await scraperService.cleanupScreenshots();
+    } catch (error) {
+      logger.error(`Error cleaning screenshots: ${error.message}`);
+    }
+    
+    // Only close the browser if we're not in recovery mode
+    if (!isRecovering) {
+      try {
+        await browserPool.close();
+      } catch (error) {
+        logger.error(`Error closing browser: ${error.message}`);
+      }
+    }
+    
+    logger.info(`Price scraper complete:`);
+    logger.info(`- Successfully updated ${results.success} item sources`);
+    logger.info(`- Failed to update ${results.failed} item sources`);
+    logger.info(`- Updated ${results.materialUpdates || 0} material items`);
+    logger.info(`- Marked ${results.outdated || 0} URLs as outdated`);
+    
+    return {
+      success: true,
+      message: `Processed ${materialItems.length} material items`,
+      results
+    };
+  } catch (error) {
+    logger.error(`Error processing material items: ${error.message}`);
+    
+    // Ensure browser is closed if not in recovery mode
+    if (!isRecovering) {
+      try {
+        await browserPool.close();
+      } catch (closeError) {
+        logger.error(`Error closing browser: ${closeError.message}`);
+      }
+    }
+    
+    return {
+      success: false,
+      message: `Error processing material items: ${error.message}`,
+      error: error.message
+    };
+  }
+}
+
+// Handle process exit cleanly
+process.on('SIGINT', async () => {
+  logger.info('Received SIGINT - shutting down gracefully');
+  await cleanup();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  logger.info('Received SIGTERM - shutting down gracefully');
+  await cleanup();
+  process.exit(0);
+});
+
+// If this file is run directly (not imported)
+if (import.meta.url === `file://${process.argv[1]}`) {
+  // Parse command line arguments
+  const args = process.argv.slice(2);
+  const options = {
+    limit: null,
+    materialItemId: null,
+    concurrency: 3
+  };
+  
+  // Process command line arguments
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    
+    if (arg === '--limit' && i + 1 < args.length) {
+      options.limit = parseInt(args[i + 1], 10);
+      i++;
+    } else if (arg === '--material-item-id' && i + 1 < args.length) {
+      options.materialItemId = args[i + 1];
+      i++;
+    } else if (arg === '--concurrency' && i + 1 < args.length) {
+      options.concurrency = parseInt(args[i + 1], 10);
+      i++;
     }
   }
+  
+  // Run as standalone script
+  (async () => {
+    try {
+      await initialize();
+      
+      if (options.materialItemId) {
+        // Process a specific material item
+        const materialItems = await databaseService.fetchMaterialItems();
+        const materialItem = materialItems.find(item => item.id === options.materialItemId);
+        
+        if (materialItem) {
+          const result = await processMaterialItem(materialItem);
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.error(`Material item with ID ${options.materialItemId} not found`);
+          process.exit(1);
+        }
+      } else {
+        // Process all material items
+        const result = await processAllMaterialItems(options);
+        
+        if (result.success) {
+          process.exit(0);
+        } else {
+          process.exit(1);
+        }
+      }
+      
+      await cleanup();
+    } catch (error) {
+      console.error(`Unhandled error: ${error.message}`);
+      process.exit(1);
+    }
+  })();
 }
 
-// Parse command line arguments
-const args = process.argv.slice(2);
-const options = {};
-
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--limit' && i + 1 < args.length) {
-    options.limit = parseInt(args[i + 1], 10);
-    i++;
-  } else if (args[i] === '--material-item-id' && i + 1 < args.length) {
-    options.materialItemId = args[i + 1];
-    i++;
-  }
-}
-
-// Run the main function
-main(options);
+export default {
+  initialize,
+  cleanup,
+  processMaterialItem,
+  processAllMaterialItems
+};
